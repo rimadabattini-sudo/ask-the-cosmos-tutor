@@ -2,10 +2,12 @@
 grounded in NASA's public Image & Video Library and the Astronomy Picture of the Day."""
 
 import html
+import json
 import os
 import random
 import re
 import time
+import uuid
 from urllib.parse import quote
 
 import requests
@@ -379,6 +381,22 @@ a:hover { text-shadow: 0 0 8px rgba(77,225,255,.85); }
 [data-testid="stSidebar"] .stButton button:hover {
   border-color: #4de1ff; background: rgba(60,70,150,.45); box-shadow: 0 0 14px rgba(77,225,255,.35);
 }
+[data-testid="stSidebar"] [data-testid="stDownloadButton"] button {
+  width: 100%; border-radius: 12px; color: #e8ecff;
+  border: 1px solid rgba(150,160,255,.25); background: rgba(20,24,60,.6);
+}
+[data-testid="stSidebar"] [data-testid="stDownloadButton"] button:hover {
+  border-color: #4de1ff; box-shadow: 0 0 14px rgba(77,225,255,.35);
+}
+[data-testid="stSidebar"] button:disabled { opacity: .45; }
+[data-testid="stFileUploaderDropzone"] {
+  background: rgba(20,24,60,.6) !important; border: 1px dashed rgba(150,160,255,.45) !important;
+  border-radius: 12px !important;
+}
+[data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploader"] label { color: #e8ecff !important; }
+[data-testid="stFileUploaderDropzone"] button {
+  background: rgba(60,70,150,.6) !important; border: 1px solid rgba(150,160,255,.4) !important;
+}
 [data-testid="stSidebar"] button[kind="primary"],
 [data-testid="stSidebar"] [data-testid="stBaseButton-primary"] {
   background: linear-gradient(90deg, #7c5cff, #ff5fc8) !important; border: none !important;
@@ -405,6 +423,11 @@ div:has(> [role="listbox"]), [data-baseweb="popover"] ul, [data-baseweb="menu"] 
 [role="option"]:hover, [role="option"][data-focused="true"], [role="option"][aria-selected="true"],
 [data-baseweb="popover"] li:hover, [data-baseweb="menu"] li:hover {
   background: #1c2260 !important;
+}
+
+/* Expander headers stay readable in a light-mode browser too */
+[data-testid="stExpander"] details summary, [data-testid="stExpander"] details summary * {
+  color: #e8ecff !important; background: transparent !important;
 }
 
 /* Expander (picture of the day) */
@@ -585,6 +608,132 @@ def render(msg):
         st.image(msg["image"]["url"], caption=msg["image"]["title"], width=320)
 
 
+# ---------- Saved chats ----------
+# Chats are kept in the visitor's own browser session and are never sent to a server for storage.
+# To keep one for good, the visitor downloads it and can load it back later.
+MAX_CHATS = 12
+MAX_UPLOAD_BYTES = 2_000_000
+
+
+def short_title(text, limit=34):
+    """A short, safe sidebar title (markdown characters removed)."""
+    text = re.sub(r"[\\`*_\[\]()<>#~|]", "", " ".join(str(text).split()))
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def new_chat():
+    return {"id": uuid.uuid4().hex[:8], "title": "New chat", "messages": []}
+
+
+def current_chat():
+    return st.session_state.chats[st.session_state.current]
+
+
+def trim_chats():
+    """Keep the list short by dropping the oldest chats (never the open one)."""
+    chats = st.session_state.chats
+    for cid in list(chats):
+        if len(chats) <= MAX_CHATS:
+            break
+        if cid != st.session_state.current:
+            del chats[cid]
+
+
+def start_new_chat():
+    if current_chat()["messages"]:  # don't pile up empty chats
+        chat = new_chat()
+        st.session_state.chats[chat["id"]] = chat
+        st.session_state.current = chat["id"]
+        trim_chats()
+
+
+def open_chat(chat_id):
+    st.session_state.current = chat_id
+
+
+def delete_current_chat():
+    chats = st.session_state.chats
+    chats.pop(st.session_state.current, None)
+    if not chats:
+        chat = new_chat()
+        chats[chat["id"]] = chat
+    st.session_state.current = list(chats)[-1]
+
+
+def chat_to_json(chat):
+    payload = {
+        "app": "ask-the-cosmos",
+        "version": 1,
+        "title": chat["title"],
+        "messages": [{k: m[k] for k in ("role", "content", "level") if k in m} for m in chat["messages"]],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def chat_to_markdown(chat):
+    lines = [f"# {chat['title']}", ""]
+    for m in chat["messages"]:
+        if m["role"] == "user":
+            lines += [f"**You:** {m['content']}", ""]
+        else:
+            lines += [f"**Cosmos ({m.get('level', 'answer')}):**", "", m["content"], ""]
+    return "\n".join(lines)
+
+
+def parse_chat_file(raw):
+    """Validate an uploaded chat file and return a clean chat. Raises ValueError with a friendly message."""
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise ValueError("That file is too big to be a saved chat.")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise ValueError("That doesn't look like a saved Cosmos chat file.")
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        raise ValueError("That doesn't look like a saved Cosmos chat file.")
+
+    messages = []
+    for m in data["messages"][:200]:
+        if not isinstance(m, dict):
+            continue
+        role, content = m.get("role"), m.get("content")
+        if role not in ("user", "assistant") or not isinstance(content, str) or not content.strip():
+            continue
+        msg = {"role": role, "content": content[:20000]}
+        level = m.get("level")
+        if role == "assistant" and isinstance(level, str) and level in LEVELS:
+            msg["level"] = level
+        messages.append(msg)
+    if not messages:
+        raise ValueError("That chat file has no messages in it.")
+
+    title = data.get("title") if isinstance(data.get("title"), str) else ""
+    first_question = next((m["content"] for m in messages if m["role"] == "user"), "Saved chat")
+    chat = new_chat()
+    chat["title"] = short_title(title or first_question) or "Saved chat"
+    chat["messages"] = messages
+    return chat
+
+
+def load_uploaded_chat():
+    """Runs when a file is chosen in the uploader."""
+    n = st.session_state.upload_n
+    st.session_state.upload_error = None
+    f = st.session_state.get(f"chat_upload_{n}")
+    st.session_state.upload_n = n + 1  # a fresh, empty uploader appears afterwards
+    if f is None:
+        return
+    try:
+        if f.size > MAX_UPLOAD_BYTES:
+            raise ValueError("That file is too big to be a saved chat.")
+        chat = parse_chat_file(f.getvalue())
+    except ValueError as e:
+        st.session_state.upload_error = str(e)
+        return
+    st.session_state.chats[chat["id"]] = chat
+    st.session_state.current = chat["id"]
+    trim_chats()
+
+
 # ---------- Interface ----------
 inject_css()
 
@@ -608,10 +757,46 @@ if "suggestions" not in st.session_state:
     # New session (including every page refresh) = new random questions
     st.session_state.suggestions = random.sample(QUESTION_POOL, SUGGESTION_COUNT)
 
+if "chats" not in st.session_state:
+    first = new_chat()
+    st.session_state.chats = {first["id"]: first}
+    st.session_state.current = first["id"]
+    st.session_state.upload_n = 0
+    st.session_state.upload_error = None
+
 with st.sidebar:
     st.markdown("### 🎚️ Reading level")
     level = st.selectbox("Explain it like I'm a...", list(LEVELS), index=1)
     st.caption(f"{LEVELS[level]['icon']} {LEVELS[level]['blurb']}")
+
+    st.markdown("### 💬 Your chats")
+    st.button("➕ New chat", key="new_chat", on_click=start_new_chat)
+    for cid in reversed(list(st.session_state.chats)):  # newest first
+        saved = st.session_state.chats[cid]
+        marker = "●" if cid == st.session_state.current else "○"
+        st.button(f"{marker} {saved['title']}", key=f"open_{cid}", on_click=open_chat, args=(cid,))
+    with st.expander("💾 Save or load a chat"):
+        st.caption(
+            "Chats live only in this browser session and are not stored on any server. "
+            "Download one to keep it, then load it back whenever you like."
+        )
+        open_one = current_chat()
+        st.download_button(
+            "Download chat (.json)", data=chat_to_json(open_one), file_name="cosmos-chat.json",
+            mime="application/json", disabled=not open_one["messages"],
+        )
+        st.download_button(
+            "Readable copy (.md)", data=chat_to_markdown(open_one), file_name="cosmos-chat.md",
+            mime="text/markdown", disabled=not open_one["messages"],
+        )
+        st.file_uploader(
+            "Load a saved chat", type=["json"], key=f"chat_upload_{st.session_state.upload_n}",
+            on_change=load_uploaded_chat,
+        )
+        if st.session_state.get("upload_error"):
+            st.error(st.session_state.upload_error)
+        st.button("🗑️ Delete this chat", on_click=delete_current_chat, disabled=not open_one["messages"])
+
     st.markdown("### 🎲 Try a question")
     if st.button("🔀 Shuffle questions", type="primary"):
         st.session_state.suggestions = new_suggestions(exclude=st.session_state.suggestions)
@@ -620,19 +805,21 @@ with st.sidebar:
         if st.button(ex):
             clicked = ex
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+chat = current_chat()
 
-for m in st.session_state.messages:
+for m in chat["messages"]:
     with st.chat_message(m["role"], avatar=AVATARS[m["role"]]):
         render(m)
 
 prompt = st.chat_input("Launch a question into the cosmos... 🚀") or clicked
 
 if prompt:
-    history = list(st.session_state.messages)
+    history = list(chat["messages"])
+    first_message = not chat["messages"]
+    if first_message:
+        chat["title"] = short_title(prompt) or "New chat"
     user_msg = {"role": "user", "content": prompt}
-    st.session_state.messages.append(user_msg)
+    chat["messages"].append(user_msg)
     with st.chat_message("user", avatar=AVATARS["user"]):
         render(user_msg)
     with st.chat_message("assistant", avatar=AVATARS["assistant"]):
@@ -640,4 +827,6 @@ if prompt:
             result = answer(prompt, history, level)
         reply = {"role": "assistant", "level": level, **result}
         render(reply)
-    st.session_state.messages.append(reply)
+    chat["messages"].append(reply)
+    if first_message:
+        st.rerun()  # refresh the sidebar so the new chat's title shows up immediately
